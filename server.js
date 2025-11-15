@@ -1,20 +1,19 @@
-// server.js — Pino Whisper backend
+// server.js — Pino Whisper backend (no socket.io version)
 // Run: node server.js  (Node 18+)
 // ENV: PORT (Render sets it), CORS_ORIGIN (your site, e.g. https://www.pinowhisper.com)
 
 import express from "express";
-import http from "http";
-import { Server } from "socket.io";
 import cors from "cors";
 import crypto from "crypto";
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: process.env.CORS_ORIGIN || "*", methods: ["GET", "POST"] }
-});
 
-app.use(cors());
+app.use(
+  cors({
+    origin: process.env.CORS_ORIGIN || "*",
+    methods: ["GET", "POST"],
+  })
+);
 app.use(express.json());
 
 // -----------------------------------------------------
@@ -70,13 +69,10 @@ app.post("/api/wall", (req, res) => {
       text: cleanText,
       nick: cleanNick,
       when: makeWhenLabel(now.toISOString()),
-      createdAt: now.toISOString()
+      createdAt: now.toISOString(),
     };
 
     wallPosts.push(item);
-
-    // broadcast to all connected sockets
-    io.emit("wall:new", item);
 
     return res.json(item);
   } catch (err) {
@@ -111,9 +107,12 @@ function deriveAddressFromHash(hashHex) {
   const h = (hashHex || "").slice(0, 16).toUpperCase().padEnd(16, "0");
   return (
     "MWC-" +
-    h.slice(0, 4) + "-" +
-    h.slice(4, 8) + "-" +
-    h.slice(8, 12) + "-" +
+    h.slice(0, 4) +
+    "-" +
+    h.slice(4, 8) +
+    "-" +
+    h.slice(8, 12) +
+    "-" +
     h.slice(12, 16)
   );
 }
@@ -134,7 +133,7 @@ function getOrCreateWallet(nickname, mnemonic) {
       nickname: nick,
       balance: START_BALANCE,
       createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
     };
     wallets.set(key, w);
   } else {
@@ -154,7 +153,7 @@ function publicWallet(w) {
     nickname: w.nickname,
     balance: Number(w.balance.toFixed(DECIMALS)),
     createdAt: w.createdAt,
-    updatedAt: w.updatedAt
+    updatedAt: w.updatedAt,
   };
 }
 
@@ -178,8 +177,12 @@ app.post("/api/wallet", (req, res) => {
 // body: { address, amount, reason }
 app.post("/api/wallet/earn", (req, res) => {
   try {
-    const { address, amount, reason } = req.body || {};
-    if (!address || typeof amount !== "number" || !Number.isFinite(amount)) {
+    const { address, amount } = req.body || {};
+    if (
+      !address ||
+      typeof amount !== "number" ||
+      !Number.isFinite(amount)
+    ) {
       return res.status(400).json({ error: "Invalid payload." });
     }
 
@@ -194,10 +197,11 @@ app.post("/api/wallet/earn", (req, res) => {
       return res.status(404).json({ error: "Wallet not found." });
     }
 
-    target.balance = Number((target.balance + amount).toFixed(DECIMALS));
+    target.balance = Number(
+      (target.balance + amount).toFixed(DECIMALS)
+    );
     target.updatedAt = new Date().toISOString();
 
-    // TODO: record tx history later
     return res.json(publicWallet(target));
   } catch (err) {
     console.error("Wallet earn error", err);
@@ -209,8 +213,12 @@ app.post("/api/wallet/earn", (req, res) => {
 // body: { address, amount, reason }
 app.post("/api/wallet/spend", (req, res) => {
   try {
-    const { address, amount, reason } = req.body || {};
-    if (!address || typeof amount !== "number" || !Number.isFinite(amount)) {
+    const { address, amount } = req.body || {};
+    if (
+      !address ||
+      typeof amount !== "number" ||
+      !Number.isFinite(amount)
+    ) {
       return res.status(400).json({ error: "Invalid payload." });
     }
 
@@ -229,10 +237,11 @@ app.post("/api/wallet/spend", (req, res) => {
       return res.status(400).json({ error: "Insufficient balance." });
     }
 
-    target.balance = Number((target.balance - amount).toFixed(DECIMALS));
+    target.balance = Number(
+      (target.balance - amount).toFixed(DECIMALS)
+    );
     target.updatedAt = new Date().toISOString();
 
-    // TODO: record tx history later
     return res.json(publicWallet(target));
   } catch (err) {
     console.error("Wallet spend error", err);
@@ -267,26 +276,10 @@ app.get("/api/wallet/:address", (req, res) => {
 });
 
 // -----------------------------------------------------
-// 3) SOCKET.IO — basic setup (wall events for now)
-// -----------------------------------------------------
-
-io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
-
-  socket.on("disconnect", () => {
-    console.log("Client disconnected:", socket.id);
-  });
-
-  // In future you can add private chat sockets here
-  // e.g. socket.on("chat:send", ...) etc.
-});
-
-// -----------------------------------------------------
 // Start server
 // -----------------------------------------------------
 
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`Pino Whisper backend listening on port ${PORT}`);
 });
-
