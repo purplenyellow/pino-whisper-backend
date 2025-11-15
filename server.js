@@ -1,275 +1,292 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import { Pool } from "pg";
-import { randomBytes, createHash } from "crypto";
-import { v4 as uuidv4 } from "uuid";
+// server.js — Pino Whisper backend
+// Run: node server.js  (Node 18+)
+// ENV: PORT (Render sets it), CORS_ORIGIN (your site, e.g. https://www.pinowhisper.com)
 
-dotenv.config();
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import cors from "cors";
+import crypto from "crypto";
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: process.env.CORS_ORIGIN || "*", methods: ["GET", "POST"] }
+});
+
+app.use(cors());
 app.use(express.json());
 
-// ---- CORS ----
-const allowed = process.env.CORS_ORIGIN?.split(",").map(s => s.trim()) || ["*"];
-app.use(
-  cors({
-    origin: (origin, cb) =>
-      cb(null, allowed.includes("*") || allowed.includes(origin)),
-    credentials: false,
-  })
-);
-
-// ---- Postgres ----
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.PGSSL === "true" ? { rejectUnauthorized: false } : false,
-});
-
-// ---- Helper: simple word list for wallets ----
-const WORDS = [
-  "moon", "seed", "wish", "dream", "soft", "calm", "gentle", "leaf",
-  "river", "stone", "dawn", "glow", "quiet", "petal", "spark", "night",
-  "honey", "moss", "cloud", "garden", "cotton", "feather", "light",
-  "ember", "gold", "whisper", "sprout", "breeze", "shell", "canyon",
-  "star", "branch", "candle", "mint", "bamboo", "pearl"
-];
-
-function genWords(n = 12) {
-  const b = randomBytes(n);
-  return Array.from(b, (x, i) => WORDS[(x + i) % WORDS.length]).slice(0, n);
-}
-
-function addrFromPhrase(phrase) {
-  const h = createHash("sha256")
-    .update(phrase + "|v1")
-    .digest("hex")
-    .slice(0, 10)
-    .toUpperCase();
-  return `PW-${h}`;
-}
-
-// ---- Health ----
-app.get("/api/health", (req, res) => res.json({ ok: true }));
-
-// ---- Wallet API ----
-
-// Create/Update wallet from { nickname, mnemonic }
-app.post("/api/wallet", async (req, res) => {
-  try {
-    const nickname = String(req.body?.nickname || "").trim().slice(0, 64);
-    const mnemonic = String(req.body?.mnemonic || "").trim();
-
-    const words = mnemonic.split(/\s+/).filter(Boolean);
-    if (!nickname || words.length < 12) {
-      return res.status(400).json({ error: "bad_payload" });
-    }
-
-    const address = addrFromPhrase(mnemonic);
-
-    const q = `
-      INSERT INTO wallets (id, address, words, alias, balance, created_at)
-      VALUES (gen_random_uuid(), $1, $2, $3, 0, now())
-      ON CONFLICT (address)
-      DO UPDATE SET alias = EXCLUDED.alias
-      RETURNING id, address, alias, balance, created_at
-    `;
-    const { rows } = await pool.query(q, [address, mnemonic, nickname]);
-
-    return res.json(rows[0]);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "wallet_upsert_failed" });
-  }
-});
-
-app.post("/api/wallet/create", async (req, res) => {
-  const alias = (req.body?.alias || "").slice(0, 64);
-  const words = genWords(12);
-  const phrase = words.join(" ");
-  const address = addrFromPhrase(phrase);
-  const id = uuidv4();
-  try {
-    const q = `
-      INSERT INTO wallets (id,address,words,alias,balance,created_at)
-      VALUES ($1,$2,$3,$4,$5,now())
-      RETURNING id,address,alias,balance,created_at
-    `;
-    const { rows } = await pool.query(q, [id, address, phrase, alias, 0]);
-    res.json({ ...rows[0], words });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "create_failed" });
-  }
-});
-
-app.post("/api/wallet/import", async (req, res) => {
-  const phrase = (req.body?.words || "").trim();
-  if (!phrase || phrase.split(/\s+/).length !== 12) {
-    return res.status(400).json({ error: "need_12_words" });
-  }
-  const address = addrFromPhrase(phrase);
-  try {
-    const found = await pool.query(
-      `SELECT id,address,alias,balance,created_at FROM wallets WHERE words=$1`,
-      [phrase]
-    );
-    if (found.rowCount > 0) {
-      return res.json(found.rows[0]);
-    }
-    const id = uuidv4();
-    const q = `
-      INSERT INTO wallets (id,address,words,alias,balance,created_at)
-      VALUES ($1,$2,$3,$4,$5,now())
-      RETURNING id,address,alias,balance,created_at
-    `;
-    const { rows } = await pool.query(q, [id, address, phrase, "", 0]);
-    res.json(rows[0]);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "import_failed" });
-  }
-});
-
-app.get("/api/wallet/:id", async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id,address,alias,balance,created_at FROM wallets WHERE id=$1`,
-      [req.params.id]
-    );
-    if (rows.length === 0)
-      return res.status(404).json({ error: "not_found" });
-    res.json(rows[0]);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "fetch_failed" });
-  }
-});
-
-// Award MWC
-app.post("/api/wallet/:id/award", async (req, res) => {
-  const amount = Math.max(0, parseInt(req.body?.amount || 0, 10));
-  if (!amount) return res.status(400).json({ error: "bad_amount" });
-
-  try {
-    const { rows } = await pool.query(
-      `UPDATE wallets SET balance = balance + $1 WHERE id=$2 RETURNING id,address,alias,balance,created_at`,
-      [amount, req.params.id]
-    );
-    if (rows.length === 0) return res.status(404).json({ error: "not_found" });
-    res.json(rows[0]);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "award_failed" });
-  }
-});
-
-// Spend MWC
-app.post("/api/wallet/:id/spend", async (req, res) => {
-  const amount = Math.max(0, parseInt(req.body?.amount || 0, 10));
-  if (!amount) return res.status(400).json({ error: "bad_amount" });
-
-  try {
-    const { rows } = await pool.query(
-      `SELECT balance FROM wallets WHERE id=$1`,
-      [req.params.id]
-    );
-
-    if (rows.length === 0) return res.status(404).json({ error: "not_found" });
-    if (rows[0].balance < amount) {
-      return res.status(400).json({ error: "insufficient_funds" });
-    }
-
-    const upd = await pool.query(
-      `UPDATE wallets SET balance = balance - $1 WHERE id=$2 RETURNING id,address,alias,balance,created_at`,
-      [amount, req.params.id]
-    );
-
-    res.json(upd.rows[0]);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "spend_failed" });
-  }
-});
-
-// ---- Whispers Wall API ----
-
-const CREATE_WHISPERS_TABLE = `
-  CREATE TABLE IF NOT EXISTS whispers (
-    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    text text NOT NULL,
-    nick text NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    likes integer NOT NULL DEFAULT 0
-  );
-`;
-
-// Get latest whispers
-app.get("/api/wall", async (req, res) => {
-  try {
-    await pool.query(CREATE_WHISPERS_TABLE);
-    const { rows } = await pool.query(
-      `SELECT id, text, nick, created_at FROM whispers
-       ORDER BY created_at DESC
-       LIMIT 50`
-    );
-
-    const mapped = rows.map(row => ({
-      id: row.id,
-      text: row.text,
-      nick: row.nick || "someone",
-      when: "just now",   // frontend can show a nicer string later
-    }));
-
-    res.json(mapped);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "wall_list_failed" });
-  }
-});
-
-// Post a new whisper
-app.post("/api/wall", async (req, res) => {
-  try {
-    await pool.query(CREATE_WHISPERS_TABLE);
-
-    const rawText = String(req.body?.text || "").trim();
-    const rawNick = String(req.body?.nick || "").trim();
-
-    const text = rawText.slice(0, 500);
-    const nick = (rawNick || "someone").slice(0, 40);
-
-    if (!text) {
-      return res.status(400).json({ error: "empty_text" });
-    }
-
-    const id = uuidv4();
-    const q = `
-      INSERT INTO whispers (id, text, nick, created_at, likes)
-      VALUES ($1, $2, $3, now(), 0)
-      RETURNING id, text, nick, created_at, likes
-    `;
-    const { rows } = await pool.query(q, [id, text, nick]);
-    const row = rows[0];
-
-    res.json({
-      id: row.id,
-      text: row.text,
-      nick: row.nick,
-      when: "just now",
-      likes: row.likes,
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "wall_create_failed" });
-  }
-});
-
-// ---- Root route ----
+// -----------------------------------------------------
+// Basic health routes
+// -----------------------------------------------------
 app.get("/", (req, res) => {
-  res.send("✨ Pino Whisper Backend is running ✨");
+  res.send("Pino Whisper backend is running 🌙");
 });
 
-// ---- Start server ----
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Pino Whisper API on :${PORT}`));
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
+// -----------------------------------------------------
+// 1) WHISPERS WALL (soft anonymous public posts)
+// -----------------------------------------------------
+
+// In-memory store for wall posts (for now; later replace with DB)
+const wallPosts = []; // { id, text, nick, when, createdAt }
+
+let nextWallId = 1;
+
+function makeWhenLabel(dateString) {
+  // For now just return "just now" for new posts.
+  // Later you can format "2 min ago", etc.
+  return "just now";
+}
+
+// GET /api/wall  -> list recent whispers
+app.get("/api/wall", (req, res) => {
+  // newest first
+  const sorted = [...wallPosts].sort(
+    (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+  );
+  res.json(sorted);
+});
+
+// POST /api/wall  -> add a new whisper
+// body: { text, nick }
+app.post("/api/wall", (req, res) => {
+  try {
+    const { text, nick } = req.body || {};
+    const cleanText = (text || "").trim();
+    const cleanNick = (nick || "someone").trim() || "someone";
+
+    if (!cleanText) {
+      return res.status(400).json({ error: "Text is required." });
+    }
+
+    const now = new Date();
+    const item = {
+      id: String(nextWallId++),
+      text: cleanText,
+      nick: cleanNick,
+      when: makeWhenLabel(now.toISOString()),
+      createdAt: now.toISOString()
+    };
+
+    wallPosts.push(item);
+
+    // broadcast to all connected sockets
+    io.emit("wall:new", item);
+
+    return res.json(item);
+  } catch (err) {
+    console.error("Error in /api/wall POST", err);
+    return res.status(500).json({ error: "Failed to post whisper." });
+  }
+});
+
+// -----------------------------------------------------
+// 2) MOONWISH WALLET (real shared balance inside Pino Whisper)
+// -----------------------------------------------------
+//
+// IMPORTANT:
+// - This is "real" inside your app: one wallet, one balance, shared across devices.
+// - For production, replace the in-memory Map with a database.
+// - Later you can connect these records to a real blockchain token.
+//
+// Frontend already calls POST /api/wallet from wallet.js.
+// -----------------------------------------------------
+
+const wallets = new Map(); // key: mnemonicHash -> wallet object
+const START_BALANCE = 1.0; // starting MoonWish Coins for new wallet
+const DECIMALS = 3;
+
+// helper: hash mnemonic so we never store raw words
+function hashMnemonic(mnemonic) {
+  return crypto.createHash("sha256").update(String(mnemonic)).digest("hex");
+}
+
+// helper: derive a pretty address from the hash
+function deriveAddressFromHash(hashHex) {
+  const h = (hashHex || "").slice(0, 16).toUpperCase().padEnd(16, "0");
+  return (
+    "MWC-" +
+    h.slice(0, 4) + "-" +
+    h.slice(4, 8) + "-" +
+    h.slice(8, 12) + "-" +
+    h.slice(12, 16)
+  );
+}
+
+function getOrCreateWallet(nickname, mnemonic) {
+  const nick = (nickname || "Guest").slice(0, 24);
+  const mnRaw = (mnemonic || "").trim();
+  if (!mnRaw) return null;
+
+  const key = hashMnemonic(mnRaw);
+  let w = wallets.get(key);
+
+  if (!w) {
+    const addr = deriveAddressFromHash(key);
+    w = {
+      id: key,
+      address: addr,
+      nickname: nick,
+      balance: START_BALANCE,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    wallets.set(key, w);
+  } else {
+    if (nick && nick !== w.nickname) {
+      w.nickname = nick;
+    }
+    w.updatedAt = new Date().toISOString();
+  }
+
+  return w;
+}
+
+function publicWallet(w) {
+  if (!w) return null;
+  return {
+    address: w.address,
+    nickname: w.nickname,
+    balance: Number(w.balance.toFixed(DECIMALS)),
+    createdAt: w.createdAt,
+    updatedAt: w.updatedAt
+  };
+}
+
+// POST /api/wallet -> create or fetch wallet for nickname + mnemonic
+// body: { nickname, mnemonic }
+app.post("/api/wallet", (req, res) => {
+  try {
+    const { nickname, mnemonic } = req.body || {};
+    const w = getOrCreateWallet(nickname, mnemonic);
+    if (!w) {
+      return res.status(400).json({ error: "Missing mnemonic." });
+    }
+    return res.json(publicWallet(w));
+  } catch (err) {
+    console.error("Wallet error", err);
+    return res.status(500).json({ error: "Wallet error." });
+  }
+});
+
+// POST /api/wallet/earn -> add balance
+// body: { address, amount, reason }
+app.post("/api/wallet/earn", (req, res) => {
+  try {
+    const { address, amount, reason } = req.body || {};
+    if (!address || typeof amount !== "number" || !Number.isFinite(amount)) {
+      return res.status(400).json({ error: "Invalid payload." });
+    }
+
+    let target = null;
+    for (const w of wallets.values()) {
+      if (w.address === address) {
+        target = w;
+        break;
+      }
+    }
+    if (!target) {
+      return res.status(404).json({ error: "Wallet not found." });
+    }
+
+    target.balance = Number((target.balance + amount).toFixed(DECIMALS));
+    target.updatedAt = new Date().toISOString();
+
+    // TODO: record tx history later
+    return res.json(publicWallet(target));
+  } catch (err) {
+    console.error("Wallet earn error", err);
+    return res.status(500).json({ error: "Wallet earn error." });
+  }
+});
+
+// POST /api/wallet/spend -> subtract balance if enough
+// body: { address, amount, reason }
+app.post("/api/wallet/spend", (req, res) => {
+  try {
+    const { address, amount, reason } = req.body || {};
+    if (!address || typeof amount !== "number" || !Number.isFinite(amount)) {
+      return res.status(400).json({ error: "Invalid payload." });
+    }
+
+    let target = null;
+    for (const w of wallets.values()) {
+      if (w.address === address) {
+        target = w;
+        break;
+      }
+    }
+    if (!target) {
+      return res.status(404).json({ error: "Wallet not found." });
+    }
+
+    if (target.balance < amount) {
+      return res.status(400).json({ error: "Insufficient balance." });
+    }
+
+    target.balance = Number((target.balance - amount).toFixed(DECIMALS));
+    target.updatedAt = new Date().toISOString();
+
+    // TODO: record tx history later
+    return res.json(publicWallet(target));
+  } catch (err) {
+    console.error("Wallet spend error", err);
+    return res.status(500).json({ error: "Wallet spend error." });
+  }
+});
+
+// GET /api/wallet/:address -> fetch wallet summary by address
+app.get("/api/wallet/:address", (req, res) => {
+  try {
+    const address = req.params.address;
+    if (!address) {
+      return res.status(400).json({ error: "Missing address." });
+    }
+
+    let target = null;
+    for (const w of wallets.values()) {
+      if (w.address === address) {
+        target = w;
+        break;
+      }
+    }
+    if (!target) {
+      return res.status(404).json({ error: "Wallet not found." });
+    }
+
+    return res.json(publicWallet(target));
+  } catch (err) {
+    console.error("Wallet fetch error", err);
+    return res.status(500).json({ error: "Wallet fetch error." });
+  }
+});
+
+// -----------------------------------------------------
+// 3) SOCKET.IO — basic setup (wall events for now)
+// -----------------------------------------------------
+
+io.on("connection", (socket) => {
+  console.log("Client connected:", socket.id);
+
+  socket.on("disconnect", () => {
+    console.log("Client disconnected:", socket.id);
+  });
+
+  // In future you can add private chat sockets here
+  // e.g. socket.on("chat:send", ...) etc.
+});
+
+// -----------------------------------------------------
+// Start server
+// -----------------------------------------------------
+
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log(`Pino Whisper backend listening on port ${PORT}`);
+});
+
