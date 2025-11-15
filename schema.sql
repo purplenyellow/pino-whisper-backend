@@ -1,0 +1,8 @@
+CREATE TABLE IF NOT EXISTS wallets (
+  id UUID PRIMARY KEY,
+  address TEXT UNIQUE NOT NULL,
+  words TEXT NOT NULL,
+  alias TEXT DEFAULT '',
+  balance INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL DEFAULT now()
+);
